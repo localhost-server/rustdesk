@@ -51,9 +51,13 @@ class _PeerTabPageState extends State<PeerTabPage>
     _TabEntry(FavoritePeersView(
       menuPadding: _menuPadding(),
     )),
-    _TabEntry(DiscoveredPeersView(
-      menuPadding: _menuPadding(),
-    )),
+    _TabEntry(
+        DiscoveredPeersView(
+          menuPadding: _menuPadding(),
+        ), ({dynamic hint}) {
+      bind.mainDiscover();
+      gFFI.lanPeersModel.discoverLanPeers();
+    }),
     _TabEntry(
         AddressBook(
           menuPadding: _menuPadding(),

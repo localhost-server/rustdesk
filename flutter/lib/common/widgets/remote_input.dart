@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
 
@@ -91,6 +92,13 @@ class _RawTouchGestureDetectorRegionState
   // Timestamp of the last long press event.
   int _cacheLongPressPositionTs = 0;
   double _mouseScrollIntegral = 0; // mouse scroll speed controller
+  Timer? _scrollPacerTimer;
+  double _scrollVelocity = 0;
+  bool _isScrollDragging = false;
+  int _lastScrollUpdateMs = 0;
+  double _appSwitchDeltaX = 0;
+  bool _appSwitchFirstStepPending = false;
+  bool _isMultiFingerTouch = false;
   double _scale = 1;
 
   // Workaround tap down event when two fingers are used to scale(mobile)
@@ -140,6 +148,7 @@ class _RawTouchGestureDetectorRegionState
   onTapDown(TapDownDetails d) async {
     lastDeviceKind = d.kind;
     _lastTapDownGlobalPosition = d.globalPosition;
+    _isMultiFingerTouch = false;
     if (isNotTouchBasedDevice()) {
       return;
     }
@@ -149,13 +158,14 @@ class _RawTouchGestureDetectorRegionState
       _lastTapDownDetails = d;
     } else {
       _lastTapDownPositionForMouseMode = d.localPosition;
+      await ffi.cursorModel.move(d.localPosition.dx, d.localPosition.dy);
     }
   }
 
   onTapUp(TapUpDetails d) async {
     final TapDownDetails? lastTapDownDetails = _lastTapDownDetails;
     _lastTapDownDetails = null;
-    if (isNotTouchBasedDevice()) {
+    if (_isMultiFingerTouch || isNotTouchBasedDevice()) {
       return;
     }
     // Filter duplicate touch tap events on iOS (Magic Mouse issue).
@@ -176,7 +186,7 @@ class _RawTouchGestureDetectorRegionState
   }
 
   onTap() async {
-    if (isNotTouchBasedDevice()) {
+    if (_isMultiFingerTouch || isNotTouchBasedDevice()) {
       return;
     }
     // Filter duplicate touch tap events on iOS (Magic Mouse issue).
@@ -189,6 +199,10 @@ class _RawTouchGestureDetectorRegionState
       // Using `_lastTapDownPositionForMouseMode` instead.
       if (shouldBlockMouseModeEvent()) {
         return;
+      }
+      if (_lastTapDownPositionForMouseMode != null) {
+        await ffi.cursorModel.move(_lastTapDownPositionForMouseMode!.dx,
+            _lastTapDownPositionForMouseMode!.dy);
       }
       // Mobile, "Mouse mode"
       await inputModel.tap(MouseButtons.left);
@@ -205,11 +219,12 @@ class _RawTouchGestureDetectorRegionState
       await ffi.cursorModel.move(d.localPosition.dx, d.localPosition.dy);
     } else {
       _lastTapDownPositionForMouseMode = d.localPosition;
+      await ffi.cursorModel.move(d.localPosition.dx, d.localPosition.dy);
     }
   }
 
   onDoubleTap() async {
-    if (isNotTouchBasedDevice()) {
+    if (_isMultiFingerTouch || isNotTouchBasedDevice()) {
       return;
     }
     if (ffiModel.touchMode && ffi.cursorModel.lastIsBlocked) {
@@ -231,7 +246,7 @@ class _RawTouchGestureDetectorRegionState
 
   onLongPressDown(LongPressDownDetails d) async {
     lastDeviceKind = d.kind;
-    if (isNotTouchBasedDevice()) {
+    if (_isMultiFingerTouch || isNotTouchBasedDevice()) {
       return;
     }
     if (handleTouch) {
@@ -248,11 +263,12 @@ class _RawTouchGestureDetectorRegionState
       }
     } else {
       _lastTapDownPositionForMouseMode = d.localPosition;
+      await ffi.cursorModel.move(d.localPosition.dx, d.localPosition.dy);
     }
   }
 
   onLongPressUp() async {
-    if (isNotTouchBasedDevice()) {
+    if (_isMultiFingerTouch || isNotTouchBasedDevice()) {
       return;
     }
     if (handleTouch) {
@@ -262,7 +278,7 @@ class _RawTouchGestureDetectorRegionState
 
   // for mobiles
   onLongPress() async {
-    if (isNotTouchBasedDevice()) {
+    if (_isMultiFingerTouch || isNotTouchBasedDevice()) {
       return;
     }
     if (!ffi.ffiModel.isPeerMobile) {
@@ -275,6 +291,10 @@ class _RawTouchGestureDetectorRegionState
       } else {
         if (shouldBlockMouseModeEvent()) {
           return;
+        }
+        if (_lastTapDownPositionForMouseMode != null) {
+          await ffi.cursorModel.move(_lastTapDownPositionForMouseMode!.dx,
+              _lastTapDownPositionForMouseMode!.dy);
         }
       }
       await inputModel.tap(MouseButtons.right);
@@ -312,12 +332,15 @@ class _RawTouchGestureDetectorRegionState
       return;
     }
 
-    // mobile mouse mode or desktop touch screen
-    final isMobileMouseMode = isMobile && !ffiModel.touchMode;
-    // We can't use `d.localPosition` here because it's always (0, 0) on desktop.
     final isDesktopInRemoteRect = (isDesktop || isWebDesktop) &&
         ffi.cursorModel.isInRemoteRect(_doubleFinerTapPosition);
-    if (isMobileMouseMode || isDesktopInRemoteRect) {
+    if (isMobile || isDesktopInRemoteRect) {
+      if (isMobile &&
+          ffiModel.touchMode &&
+          !inputModel.relativeMouseMode.value) {
+        await ffi.cursorModel
+            .move(_doubleFinerTapPosition.dx, _doubleFinerTapPosition.dy);
+      }
       await inputModel.tap(MouseButtons.right);
     }
   }
@@ -356,13 +379,16 @@ class _RawTouchGestureDetectorRegionState
     final TapDownDetails? lastTapDownDetails = _lastTapDownDetails;
     _lastTapDownDetails = null;
     lastDeviceKind = d.kind ?? lastDeviceKind;
-    if (isNotTouchBasedDevice()) {
+    if (_isMultiFingerTouch || isNotTouchBasedDevice()) {
       return;
     }
     if (handleTouch) {
       if (lastTapDownDetails != null) {
         await ffi.cursorModel.move(lastTapDownDetails.localPosition.dx,
             lastTapDownDetails.localPosition.dy);
+      }
+      if (_isMultiFingerTouch) {
+        return;
       }
       if (ffi.cursorModel.shouldBlock(d.localPosition.dx, d.localPosition.dy)) {
         return;
@@ -386,26 +412,34 @@ class _RawTouchGestureDetectorRegionState
         await ffi.cursorModel
             .move(_cacheLongPressPosition.dx, _cacheLongPressPosition.dy);
       }
+      if (_isMultiFingerTouch || !_touchModePanStarted) {
+        _touchModePanStarted = false;
+        return;
+      }
       // In relative mouse mode, skip mouse down - only send movement via sendMobileRelativeMouseMove
       if (!inputModel.relativeMouseMode.value) {
         await inputModel.sendMouse('down', MouseButtons.left);
       }
       await ffi.cursorModel.move(d.localPosition.dx, d.localPosition.dy);
     } else {
-      final offset = ffi.cursorModel.offset;
-      final cursorX = offset.dx;
-      final cursorY = offset.dy;
-      final visible =
-          ffi.cursorModel.getVisibleRect().inflate(1); // extend edges
-      final size = MediaQueryData.fromView(View.of(context)).size;
-      if (!visible.contains(Offset(cursorX, cursorY))) {
-        await ffi.cursorModel.move(size.width / 2, size.height / 2);
+      final isMoved =
+          await ffi.cursorModel.move(d.localPosition.dx, d.localPosition.dy);
+      if (!isMoved) {
+        final offset = ffi.cursorModel.offset;
+        final cursorX = offset.dx;
+        final cursorY = offset.dy;
+        final visible =
+            ffi.cursorModel.getVisibleRect().inflate(1); // extend edges
+        final size = MediaQueryData.fromView(View.of(context)).size;
+        if (!visible.contains(Offset(cursorX, cursorY))) {
+          await ffi.cursorModel.move(size.width / 2, size.height / 2);
+        }
       }
     }
   }
 
   onOneFingerPanUpdate(DragUpdateDetails d) async {
-    if (isNotTouchBasedDevice()) {
+    if (_isMultiFingerTouch || isNotTouchBasedDevice()) {
       return;
     }
     if (ffi.cursorModel.shouldBlock(d.localPosition.dx, d.localPosition.dy)) {
@@ -417,6 +451,8 @@ class _RawTouchGestureDetectorRegionState
     // In relative mouse mode, send delta directly without position tracking.
     if (inputModel.relativeMouseMode.value) {
       await inputModel.sendMobileRelativeMouseMove(d.delta.dx, d.delta.dy);
+    } else if (!handleTouch) {
+      await ffi.cursorModel.move(d.localPosition.dx, d.localPosition.dy);
     } else {
       await ffi.cursorModel.updatePan(d.delta, d.localPosition, handleTouch);
     }
@@ -443,7 +479,160 @@ class _RawTouchGestureDetectorRegionState
   // stuck in the "started" state and cause issues such as the Magic Mouse
   // double-click problem on iPad with magic mouse.
   onOneFingerPanCancel() {
+    if (_touchModePanStarted &&
+        handleTouch &&
+        !inputModel.relativeMouseMode.value) {
+      inputModel.sendMouse('up', MouseButtons.left);
+    }
     _touchModePanStarted = false;
+  }
+
+  @override
+  void dispose() {
+    _stopScrollMomentum();
+    super.dispose();
+  }
+
+  void _stopScrollMomentum() {
+    _scrollPacerTimer?.cancel();
+    _scrollPacerTimer = null;
+    _scrollVelocity = 0;
+    _mouseScrollIntegral = 0;
+    _isScrollDragging = false;
+  }
+
+  void _ensureScrollPacerRunning() {
+    if (_scrollPacerTimer != null && _scrollPacerTimer!.isActive) {
+      return;
+    }
+    _scrollPacerTimer =
+        Timer.periodic(const Duration(milliseconds: 10), (timer) {
+      if (!_isScrollDragging) {
+        final elapsedSinceDrag =
+            DateTime.now().millisecondsSinceEpoch - _lastScrollUpdateMs;
+        if (_scrollVelocity.abs() > 0.35 && elapsedSinceDrag < 900) {
+          _scrollVelocity *= 0.88;
+          final coastGain = 0.16 * pow(_scrollVelocity.abs(), 1.45);
+          _mouseScrollIntegral += _scrollVelocity.sign * coastGain;
+        } else {
+          _scrollVelocity = 0;
+        }
+      }
+
+      if (_mouseScrollIntegral.abs() >= 1.0) {
+        int step = (_mouseScrollIntegral * 0.35).truncate();
+        if (step == 0) {
+          step = _mouseScrollIntegral > 0 ? 1 : -1;
+        }
+        _mouseScrollIntegral -= step;
+        inputModel.scroll(step);
+      } else if (!_isScrollDragging && _scrollVelocity.abs() <= 0.35) {
+        _stopScrollMomentum();
+      }
+    });
+  }
+
+  void onSingleFingerTouchStart(PointerDownEvent event) {
+    _stopScrollMomentum();
+    _isMultiFingerTouch = false;
+    lastDeviceKind = event.kind;
+    if (isNotTouchBasedDevice()) {
+      return;
+    }
+    if (!handleTouch) {
+      _lastTapDownPositionForMouseMode = event.localPosition;
+    }
+    if (!inputModel.relativeMouseMode.value) {
+      ffi.cursorModel.move(event.localPosition.dx, event.localPosition.dy);
+    }
+  }
+
+  void onMultiFingerTouchStart(Offset localPosition) {
+    _stopScrollMomentum();
+    _isMultiFingerTouch = true;
+    if (_touchModePanStarted) {
+      onOneFingerPanCancel();
+    }
+    _lastTapDownDetails = null;
+    lastDeviceKind = PointerDeviceKind.touch;
+    if (!inputModel.relativeMouseMode.value) {
+      ffi.cursorModel.move(localPosition.dx, localPosition.dy);
+    }
+  }
+
+  void onTwoFingerActivatedScrollStart(DragStartDetails d) async {
+    _stopScrollMomentum();
+    _isScrollDragging = true;
+    _lastTapDownDetails = null;
+    lastDeviceKind = d.kind ?? PointerDeviceKind.touch;
+    if (!inputModel.relativeMouseMode.value) {
+      await ffi.cursorModel.move(d.localPosition.dx, d.localPosition.dy);
+    }
+  }
+
+  void onTwoFingerActivatedScrollUpdate(DragUpdateDetails d) {
+    if (ffi.ffiModel.isPeerAndroid) {
+      return;
+    }
+    final dy = -d.delta.dy;
+    if (dy == 0) return;
+    _isScrollDragging = true;
+    _lastScrollUpdateMs = DateTime.now().millisecondsSinceEpoch;
+    _scrollVelocity = _scrollVelocity * 0.65 + dy * 0.35;
+    final expGain = (0.20 * pow(dy.abs(), 1.55)).clamp(0.12, 16.0);
+    _mouseScrollIntegral += dy.sign * expGain;
+    _ensureScrollPacerRunning();
+  }
+
+  void onTwoFingerActivatedScrollEnd(DragEndDetails d) {
+    _isScrollDragging = false;
+    final elapsedSinceDrag =
+        DateTime.now().millisecondsSinceEpoch - _lastScrollUpdateMs;
+    if (elapsedSinceDrag > 70 || _scrollVelocity.abs() < 1.2) {
+      _scrollVelocity = 0;
+    }
+  }
+
+  void onThreeFingerTap() {
+    if (ffi.ffiModel.isPeerAndroid) {
+      return;
+    }
+    inputModel.triggerShowAllApps();
+  }
+
+  void onThreeFingerAppSwitchStart(DragStartDetails d) {
+    _lastTapDownDetails = null;
+    _appSwitchDeltaX = 0;
+    _appSwitchFirstStepPending = true;
+  }
+
+  void onThreeFingerAppSwitchUpdate(DragUpdateDetails d) async {
+    if (ffi.ffiModel.isPeerAndroid) {
+      return;
+    }
+    if (_appSwitchFirstStepPending && d.delta.dx != 0) {
+      _appSwitchFirstStepPending = false;
+      _appSwitchDeltaX = 0;
+      await inputModel.stepAppSwitch(forward: d.delta.dx > 0);
+      return;
+    }
+    _appSwitchDeltaX += d.delta.dx;
+    const double stepPx = 32.0;
+    while (_appSwitchDeltaX.abs() >= stepPx) {
+      if (_appSwitchDeltaX > 0) {
+        _appSwitchDeltaX -= stepPx;
+        await inputModel.stepAppSwitch(forward: true);
+      } else {
+        _appSwitchDeltaX += stepPx;
+        await inputModel.stepAppSwitch(forward: false);
+      }
+    }
+  }
+
+  void onThreeFingerAppSwitchEnd(DragEndDetails d) {
+    _appSwitchDeltaX = 0;
+    _appSwitchFirstStepPending = false;
+    inputModel.endAppSwitch();
   }
 
   // scale + pan event
@@ -472,7 +661,14 @@ class _RawTouchGestureDetectorRegionState
       return;
     }
 
-    if (canvasLocked) return;
+    if (canvasLocked) {
+      onTwoFingerActivatedScrollUpdate(DragUpdateDetails(
+        globalPosition: d.focalPoint,
+        localPosition: d.localFocalPoint,
+        delta: d.focalPointDelta,
+      ));
+      return;
+    }
 
     if ((isDesktop || isWebDesktop)) {
       final scale = ((d.scale - _scale) * 1000).toInt();
@@ -496,6 +692,9 @@ class _RawTouchGestureDetectorRegionState
   }
 
   onTwoFingerScaleEnd(ScaleEndDetails d) async {
+    if (canvasLocked) {
+      onTwoFingerActivatedScrollEnd(DragEndDetails());
+    }
     if (isNotTouchBasedDevice()) {
       return;
     }
@@ -519,16 +718,7 @@ class _RawTouchGestureDetectorRegionState
   get onHoldDragCancel => null;
   get onThreeFingerVerticalDragUpdate => ffi.ffiModel.isPeerAndroid
       ? null
-      : (d) {
-          _mouseScrollIntegral += d.delta.dy / 4;
-          if (_mouseScrollIntegral > 1) {
-            inputModel.scroll(1);
-            _mouseScrollIntegral = 0;
-          } else if (_mouseScrollIntegral < -1) {
-            inputModel.scroll(-1);
-            _mouseScrollIntegral = 0;
-          }
-        };
+      : (DragUpdateDetails d) => onTwoFingerActivatedScrollUpdate(d);
 
   makeGestures(BuildContext context) {
     return <Type, GestureRecognizerFactory>{
@@ -582,10 +772,20 @@ class _RawTouchGestureDetectorRegionState
           ..onOneFingerPanUpdate = onOneFingerPanUpdate
           ..onOneFingerPanEnd = onOneFingerPanEnd
           ..onOneFingerPanCancel = onOneFingerPanCancel
+          ..onSingleFingerTouchStart = onSingleFingerTouchStart
+          ..onMultiFingerTouchStart = onMultiFingerTouchStart
           ..onTwoFingerScaleStart = onTwoFingerScaleStart
           ..onTwoFingerScaleUpdate = onTwoFingerScaleUpdate
           ..onTwoFingerScaleEnd = onTwoFingerScaleEnd
-          ..onThreeFingerVerticalDragUpdate = onThreeFingerVerticalDragUpdate;
+          ..onTwoFingerActivatedScrollStart = onTwoFingerActivatedScrollStart
+          ..onTwoFingerActivatedScrollUpdate = onTwoFingerActivatedScrollUpdate
+          ..onTwoFingerActivatedScrollEnd = onTwoFingerActivatedScrollEnd
+          ..onThreeFingerTap = onThreeFingerTap
+          ..onThreeFingerAppSwitchStart = onThreeFingerAppSwitchStart
+          ..onThreeFingerAppSwitchUpdate = onThreeFingerAppSwitchUpdate
+          ..onThreeFingerAppSwitchEnd = onThreeFingerAppSwitchEnd
+          ..onThreeFingerVerticalDragUpdate = onThreeFingerVerticalDragUpdate
+          ..onThreeFingerVerticalDragEnd = onTwoFingerActivatedScrollEnd;
       }),
     };
   }

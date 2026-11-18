@@ -7,7 +7,9 @@ enum GestureState {
   none,
   oneFingerPan,
   twoFingerScale,
-  threeFingerVerticalDrag
+  threeFingerVerticalDrag,
+  twoFingerActivatedScroll,
+  threeFingerActivatedAppSwitch,
 }
 
 class CustomTouchGestureRecognizer extends ScaleGestureRecognizer {
@@ -37,27 +39,279 @@ class CustomTouchGestureRecognizer extends ScaleGestureRecognizer {
   GestureDragUpdateCallback? onThreeFingerVerticalDragUpdate;
   GestureDragEndCallback? onThreeFingerVerticalDragEnd;
 
+  ValueChanged<PointerDownEvent>? onSingleFingerTouchStart;
+  ValueChanged<Offset>? onMultiFingerTouchStart;
+
+  GestureDragStartCallback? onTwoFingerActivatedScrollStart;
+  GestureDragUpdateCallback? onTwoFingerActivatedScrollUpdate;
+  GestureDragEndCallback? onTwoFingerActivatedScrollEnd;
+
+  VoidCallback? onThreeFingerTap;
+
+  GestureDragStartCallback? onThreeFingerAppSwitchStart;
+  GestureDragUpdateCallback? onThreeFingerAppSwitchUpdate;
+  GestureDragEndCallback? onThreeFingerAppSwitchEnd;
+
   var _currentState = GestureState.none;
   Timer? _debounceTimer;
+  Timer? _singleRemainingAcceptTimer;
+
+  final Set<int> _activePointers = <int>{};
+  final Map<int, Offset> _pointerDownPositions = <int, Offset>{};
+  final Map<int, Offset> _pointerLastPositions = <int, Offset>{};
+  Offset _firstPointerLocalDownPosition = Offset.zero;
+  int _maxPointersInSession = 0;
+  int _firstPointerDownTimeMs = 0;
+  bool _anyPointerMovedBeyondTapSlop = false;
+  bool _multiFingerGestureCommitted = false;
+  Offset? _singleRemainingStartPos;
+  int? _lastTrackedPointer;
+  Offset? _multiFingerInitialFocalPoint;
+
+  @override
+  void addAllowedPointer(PointerDownEvent event) {
+    if (_activePointers.isEmpty) {
+      _maxPointersInSession = 0;
+      _anyPointerMovedBeyondTapSlop = false;
+      _multiFingerGestureCommitted = false;
+      _pointerDownPositions.clear();
+      _pointerLastPositions.clear();
+      _singleRemainingStartPos = null;
+      _lastTrackedPointer = null;
+      _multiFingerInitialFocalPoint = null;
+      _firstPointerLocalDownPosition = event.localPosition;
+      _firstPointerDownTimeMs = DateTime.now().millisecondsSinceEpoch;
+    }
+    _activePointers.add(event.pointer);
+    _pointerDownPositions[event.pointer] = event.position;
+    _pointerLastPositions[event.pointer] = event.position;
+    _singleRemainingStartPos = null;
+    _lastTrackedPointer = null;
+    _singleRemainingAcceptTimer?.cancel();
+
+    if (_activePointers.length > _maxPointersInSession) {
+      _maxPointersInSession = _activePointers.length;
+    }
+    if (_activePointers.length == 1) {
+      onSingleFingerTouchStart?.call(event);
+    }
+    if (_activePointers.length == 2) {
+      onMultiFingerTouchStart?.call(_firstPointerLocalDownPosition);
+    }
+    if (_activePointers.length >= 2 &&
+        _currentState == GestureState.oneFingerPan) {
+      _debounceTimer?.cancel();
+      onOneFingerPanCancel?.call();
+      _currentState = GestureState.none;
+    }
+    if (_activePointers.length >= 3) {
+      _debounceTimer?.cancel();
+      if (_currentState == GestureState.twoFingerActivatedScroll ||
+          _currentState == GestureState.twoFingerScale) {
+        onTwoFingerActivatedScrollEnd?.call(DragEndDetails());
+      }
+      _currentState = GestureState.none;
+      _multiFingerGestureCommitted = false;
+      _anyPointerMovedBeyondTapSlop = false;
+      _multiFingerInitialFocalPoint = null;
+      _firstPointerDownTimeMs = DateTime.now().millisecondsSinceEpoch;
+      for (final p in _activePointers) {
+        final pos = _pointerLastPositions[p];
+        if (pos != null) {
+          _pointerDownPositions[p] = pos;
+        }
+      }
+    }
+
+    super.addAllowedPointer(event);
+
+    if (_activePointers.length >= 3) {
+      resolve(GestureDisposition.accepted);
+    }
+  }
+
+  @override
+  void handleEvent(PointerEvent event) {
+    if (event is PointerMoveEvent) {
+      _pointerLastPositions[event.pointer] = event.position;
+      final downPos = _pointerDownPositions[event.pointer];
+      if (downPos != null && (event.position - downPos).distance > 60.0) {
+        _anyPointerMovedBeyondTapSlop = true;
+      }
+
+      if (!isSpecialHoldDragActive &&
+          _activePointers.contains(event.pointer) &&
+          ((_maxPointersInSession == 2 && _activePointers.length <= 2) ||
+              (_maxPointersInSession == 3 && _activePointers.length <= 3))) {
+        final pointerAnchor =
+            _pointerDownPositions[event.pointer] ?? event.position;
+        final distFromAnchor = (event.position - pointerAnchor).distance;
+
+        if (_maxPointersInSession == 2) {
+          final startThreshold = _activePointers.length == 1 ? 4.0 : 6.0;
+          if (_currentState != GestureState.twoFingerActivatedScroll &&
+              distFromAnchor > startThreshold) {
+            _singleRemainingAcceptTimer?.cancel();
+            _debounceTimer?.cancel();
+            _lastTrackedPointer = event.pointer;
+            _currentState = GestureState.twoFingerActivatedScroll;
+            resolve(GestureDisposition.accepted);
+            onTwoFingerActivatedScrollStart?.call(DragStartDetails(
+              globalPosition: event.position,
+              localPosition: event.localPosition,
+              kind: event.kind,
+            ));
+          }
+          if (_currentState == GestureState.twoFingerActivatedScroll) {
+            if (_lastTrackedPointer == null ||
+                !_activePointers.contains(_lastTrackedPointer)) {
+              _lastTrackedPointer = event.pointer;
+            }
+            if (event.pointer == _lastTrackedPointer) {
+              onTwoFingerActivatedScrollUpdate?.call(DragUpdateDetails(
+                globalPosition: event.position,
+                localPosition: event.localPosition,
+                delta: event.delta,
+              ));
+            }
+            super.handleEvent(event);
+            return;
+          }
+        } else if (_maxPointersInSession == 3) {
+          final dxFromAnchor = (event.position.dx - pointerAnchor.dx).abs();
+          final startThreshold = _activePointers.length <= 2 ? 4.0 : 5.0;
+          if (_currentState != GestureState.threeFingerActivatedAppSwitch &&
+              (dxFromAnchor > startThreshold ||
+                  (_activePointers.length <= 2 && distFromAnchor > 4.0))) {
+            _singleRemainingAcceptTimer?.cancel();
+            _debounceTimer?.cancel();
+            _lastTrackedPointer = event.pointer;
+            _multiFingerGestureCommitted = true;
+            _currentState = GestureState.threeFingerActivatedAppSwitch;
+            resolve(GestureDisposition.accepted);
+            onThreeFingerAppSwitchStart?.call(DragStartDetails(
+              globalPosition: event.position,
+              localPosition: event.localPosition,
+              kind: event.kind,
+            ));
+          }
+          if (_currentState == GestureState.threeFingerActivatedAppSwitch) {
+            if (_lastTrackedPointer == null ||
+                !_activePointers.contains(_lastTrackedPointer)) {
+              _lastTrackedPointer = event.pointer;
+            }
+            if (event.pointer == _lastTrackedPointer) {
+              onThreeFingerAppSwitchUpdate?.call(DragUpdateDetails(
+                globalPosition: event.position,
+                localPosition: event.localPosition,
+                delta: event.delta,
+              ));
+            }
+            super.handleEvent(event);
+            return;
+          }
+        }
+      }
+    }
+
+    super.handleEvent(event);
+
+    if (event is PointerUpEvent || event is PointerCancelEvent) {
+      _activePointers.remove(event.pointer);
+      _pointerLastPositions.remove(event.pointer);
+      if (_activePointers.isNotEmpty &&
+          _activePointers.length < _maxPointersInSession &&
+          !isSpecialHoldDragActive &&
+          _maxPointersInSession >= 2) {
+        _singleRemainingStartPos = null;
+        _lastTrackedPointer = null;
+        if (_currentState == GestureState.none) {
+          for (final p in _activePointers) {
+            final pos = _pointerLastPositions[p];
+            if (pos != null) {
+              _pointerDownPositions[p] = pos;
+            }
+          }
+        }
+        _singleRemainingAcceptTimer?.cancel();
+        _singleRemainingAcceptTimer =
+            Timer(const Duration(milliseconds: 120), () {
+          if (_activePointers.isNotEmpty && _maxPointersInSession >= 2) {
+            resolve(GestureDisposition.accepted);
+          }
+        });
+      } else if (_activePointers.isEmpty) {
+        _singleRemainingAcceptTimer?.cancel();
+        _debounceTimer?.cancel();
+        if (_currentState == GestureState.twoFingerActivatedScroll) {
+          onTwoFingerActivatedScrollEnd?.call(DragEndDetails());
+        } else if (_currentState ==
+            GestureState.threeFingerActivatedAppSwitch) {
+          onThreeFingerAppSwitchEnd?.call(DragEndDetails());
+        } else if (_maxPointersInSession == 3 &&
+            !_anyPointerMovedBeyondTapSlop &&
+            !_multiFingerGestureCommitted &&
+            _currentState == GestureState.none) {
+          final elapsedMs =
+              DateTime.now().millisecondsSinceEpoch - _firstPointerDownTimeMs;
+          if (elapsedMs < 800) {
+            onThreeFingerTap?.call();
+          }
+        }
+        _currentState = GestureState.none;
+        _maxPointersInSession = 0;
+        _multiFingerGestureCommitted = false;
+        _singleRemainingStartPos = null;
+        _lastTrackedPointer = null;
+        _multiFingerInitialFocalPoint = null;
+      }
+    }
+  }
 
   void _init() {
     debugPrint("CustomTouchGestureRecognizer init");
     // onStart = (d) {};
     onUpdate = (d) {
+      if (_currentState == GestureState.twoFingerActivatedScroll) {
+        return;
+      }
+      if (_currentState == GestureState.threeFingerActivatedAppSwitch &&
+          d.pointerCount <= 2) {
+        return;
+      }
       _debounceTimer?.cancel();
-      if (d.pointerCount == 1 && _currentState != GestureState.oneFingerPan) {
+      if (d.pointerCount == 1 &&
+          _maxPointersInSession <= 1 &&
+          _currentState != GestureState.oneFingerPan) {
         onOneFingerStartDebounce(d);
       } else if (d.pointerCount == 2 &&
+          (_maxPointersInSession == 2 || isSpecialHoldDragActive) &&
           _currentState != GestureState.twoFingerScale) {
-        onTwoFingerStartDebounce(d);
-      } else if (d.pointerCount == 3 &&
-          _currentState != GestureState.threeFingerVerticalDrag) {
-        _currentState = GestureState.threeFingerVerticalDrag;
-        if (onThreeFingerVerticalDragStart != null) {
-          onThreeFingerVerticalDragStart!(
-              DragStartDetails(globalPosition: d.localFocalPoint));
+        if (isSpecialHoldDragActive) {
+          onTwoFingerStartDebounce(d);
+        } else {
+          _multiFingerInitialFocalPoint ??= d.focalPoint;
+          final movedDist =
+              (d.focalPoint - _multiFingerInitialFocalPoint!).distance;
+          final scaleDelta = (d.scale - 1.0).abs();
+          if (movedDist > 6.0 || scaleDelta > 0.05) {
+            _multiFingerGestureCommitted = true;
+            onTwoFingerStartDebounce(d);
+          }
         }
-        debugPrint("start threeFingerScale");
+      } else if (d.pointerCount == 3 && _maxPointersInSession == 3) {
+        _multiFingerInitialFocalPoint ??= d.focalPoint;
+        final totalDelta = d.focalPoint - _multiFingerInitialFocalPoint!;
+        if (_currentState == GestureState.none) {
+          if (totalDelta.dx.abs() > 14.0) {
+            _multiFingerGestureCommitted = true;
+            _currentState = GestureState.threeFingerActivatedAppSwitch;
+            onThreeFingerAppSwitchStart?.call(DragStartDetails(
+              globalPosition: d.focalPoint,
+              localPosition: d.localFocalPoint,
+            ));
+          }
+        }
       }
       if (_currentState != GestureState.none) {
         switch (_currentState) {
@@ -76,6 +330,9 @@ class CustomTouchGestureRecognizer extends ScaleGestureRecognizer {
               onThreeFingerVerticalDragUpdate!(_getDragUpdateDetails(d));
             }
             break;
+          case GestureState.threeFingerActivatedAppSwitch:
+            onThreeFingerAppSwitchUpdate?.call(_getDragUpdateDetails(d));
+            break;
           default:
             break;
         }
@@ -83,6 +340,10 @@ class CustomTouchGestureRecognizer extends ScaleGestureRecognizer {
       }
     };
     onEnd = (d) {
+      if (_currentState == GestureState.twoFingerActivatedScroll ||
+          _currentState == GestureState.threeFingerActivatedAppSwitch) {
+        return;
+      }
       debugPrint("ScaleGestureRecognizer onEnd");
       _debounceTimer?.cancel();
       // end
@@ -174,6 +435,12 @@ class CustomTouchGestureRecognizer extends ScaleGestureRecognizer {
   @override
   void rejectGesture(int pointer) {
     super.rejectGesture(pointer);
+    _activePointers.remove(pointer);
+    if (_activePointers.isNotEmpty) {
+      return;
+    }
+    _singleRemainingAcceptTimer?.cancel();
+    _debounceTimer?.cancel();
     switch (_currentState) {
       case GestureState.oneFingerPan:
         if (onOneFingerPanCancel != null) {
@@ -186,10 +453,27 @@ class CustomTouchGestureRecognizer extends ScaleGestureRecognizer {
       case GestureState.threeFingerVerticalDrag:
         // Reset drag state if needed, currently self-contained
         break;
+      case GestureState.twoFingerActivatedScroll:
+        onTwoFingerActivatedScrollEnd?.call(DragEndDetails());
+        break;
+      case GestureState.threeFingerActivatedAppSwitch:
+        onThreeFingerAppSwitchEnd?.call(DragEndDetails());
+        break;
       default:
         break;
     }
     _currentState = GestureState.none;
+    _maxPointersInSession = 0;
+    _multiFingerGestureCommitted = false;
+    _singleRemainingStartPos = null;
+    _multiFingerInitialFocalPoint = null;
+  }
+
+  @override
+  void dispose() {
+    _singleRemainingAcceptTimer?.cancel();
+    _debounceTimer?.cancel();
+    super.dispose();
   }
 }
 
@@ -512,7 +796,7 @@ class DoubleFinerTapGestureRecognizer extends GestureRecognizer {
         final TapDownDetails details = TapDownDetails(
           globalPosition: event.position,
           localPosition: event.localPosition,
-          kind: getKindForPointer(event.pointer),
+          kind: event.kind,
         );
         invokeCallback<void>(
             'onDoubleFinerTapDown', () => onDoubleFinerTapDown!(details));

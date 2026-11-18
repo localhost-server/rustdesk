@@ -507,6 +507,7 @@ class DiscoveredPeersView extends BasePeersView {
     final widget = super.build(context);
     bind.mainLoadLanPeers();
     bind.mainDiscover();
+    gFFI.lanPeersModel.discoverLanPeers();
     return widget;
   }
 }
